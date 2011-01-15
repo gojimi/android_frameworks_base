@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2006 The Android Open Source Project
+ * This code has been modified.  Portions copyright (C) 2010, T-Mobile USA, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,8 +80,8 @@ public:
     virtual ~AssetManager(void);
 
     static int32_t getGlobalCount();
-    
-    /*                                                                       
+
+    /*
      * Add a new source for assets.  This can be called multiple times to
      * look in multiple places for assets.  It can be either a directory (for
      * finding assets as raw files on the disk) or a ZIP file.  This newly
@@ -93,13 +94,13 @@ public:
      */
     bool addAssetPath(const String8& path, void** cookie);
 
-    /*                                                                       
+    /*
      * Convenience for adding the standard system assets.  Uses the
      * ANDROID_ROOT environment variable to find them.
      */
     bool addDefaultAssets();
 
-    /*                                                                       
+    /*
      * Iterate over the asset paths in this manager.  (Previously
      * added via addAssetPath() and addDefaultAssets().)  On first call,
      * 'cookie' must be NULL, resulting in the first cookie being returned.
@@ -108,7 +109,7 @@ public:
      */
     void* nextAssetPath(void* cookie) const;
 
-    /*                                                                       
+    /*
      * Return an asset path in the manager.  'which' must be between 0 and
      * countAssetPaths().
      */
@@ -192,7 +193,7 @@ public:
      */
     FileType getFileType(const char* fileName);
 
-    /*                                                                       
+    /*
      * Return the complete resource table to find things in the package.
      */
     const ResTable& getResources(bool required = true) const;
@@ -211,11 +212,25 @@ public:
      * the current data.
      */
     bool isUpToDate();
-    
+
     /**
      * Get the known locales for this asset manager object.
      */
     void getLocales(Vector<String8>* locales) const;
+
+    void setThemePackageInfo(const char* packageName, uint32_t styleId);
+    const char* getThemePackageName();
+
+    /*
+     * Remove existing source for assets.
+     *
+     * Also updates the ResTable object to reflect the change.
+     *
+     * Returns "true" on success, "false" on failure.
+     */
+    bool removeAssetPath(const String8 &packageName, void *cookie);
+    bool updateWithAssetPath(const String8& path, void** cookie);
+    void dumpRes();
 
 private:
     struct asset_path
@@ -224,6 +239,13 @@ private:
         FileType type;
     };
 
+    SharedBuffer* generateRedirections(SharedBuffer* entriesByTypeBuf, ResTable* rt,
+        const char* themePackageName, const char16_t* resPackageName);
+    bool generateAndWriteRedirections(ResTable* rt, const char* themePackageName,
+        uint32_t themeStyleId, const char16_t* resPackageName, const char* redirPath,
+        bool isFramework) const;
+    void loadRedirectionMappings(ResTable* rt) const;
+    void updateResTableFromAssetPath(ResTable* rt, const asset_path& ap, void* cookie) const;
     Asset* openInPathLocked(const char* fileName, AccessMode mode,
         const asset_path& path);
     Asset* openNonAssetInPathLocked(const char* fileName, AccessMode mode,
@@ -275,7 +297,7 @@ private:
         ResTable* setResourceTable(ResTable* res);
         
         bool isUpToDate();
-        
+
     protected:
         ~SharedZip();
 
@@ -322,7 +344,7 @@ private:
         static String8 getPathName(const char* path);
 
         bool isUpToDate();
-        
+
     private:
         void closeZip(int idx);
 
@@ -339,6 +361,11 @@ private:
     Vector<asset_path> mAssetPaths;
     char*           mLocale;
     char*           mVendor;
+
+    // If non-null, represents the theme package from which to construct the
+    // resource redirection map used by ResTable.
+    char*           mThemePackageName;
+    uint32_t        mThemeStyleId;
 
     mutable ResTable* mResources;
     ResTable_config* mConfig;

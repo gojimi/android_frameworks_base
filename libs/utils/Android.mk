@@ -25,6 +25,7 @@ commonSources:= \
 	CallStack.cpp \
 	Debug.cpp \
 	FileMap.cpp \
+	FileLock.cpp \
 	Flattenable.cpp \
 	ObbFile.cpp \
 	Pool.cpp \
@@ -45,6 +46,8 @@ commonSources:= \
 	ZipFileCRO.cpp \
 	ZipFileRO.cpp \
 	ZipUtils.cpp \
+	../../tools/aapt/ZipFile.cpp \
+	../../tools/aapt/ZipEntry.cpp \
 	misc.cpp
 
 

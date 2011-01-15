@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2006 The Android Open Source Project
+ * This code has been modified.  Portions copyright (C) 2010, T-Mobile USA, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,32 +17,42 @@
 
 package android.app;
 
+import com.android.internal.os.BinderInternal;
+import com.android.internal.os.RuntimeInit;
+import com.android.internal.os.SamplingProfilerIntegration;
+
+import org.apache.harmony.xnet.provider.jsse.OpenSSLSocketImpl;
+
 import android.app.backup.BackupAgent;
 import android.content.BroadcastReceiver;
 import android.content.ComponentCallbacks;
 import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.IContentProvider;
-import android.content.Intent;
 import android.content.IIntentReceiver;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.IPackageManager;
 import android.content.pm.InstrumentationInfo;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ProviderInfo;
 import android.content.pm.ServiceInfo;
+import android.content.pm.ThemeInfo;
 import android.content.res.AssetManager;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
+import android.content.res.CustomTheme;
 import android.content.res.Resources;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteDebug;
 import android.database.sqlite.SQLiteDebug.DbStats;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
-import android.os.Build;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Debug;
 import android.os.Handler;
@@ -55,6 +66,7 @@ import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.StrictMode;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.util.AndroidRuntimeException;
 import android.util.Config;
 import android.util.DisplayMetrics;
@@ -63,6 +75,7 @@ import android.util.Log;
 import android.util.LogPrinter;
 import android.util.Slog;
 import android.view.Display;
+import android.view.InflateException;
 import android.view.View;
 import android.view.ViewDebug;
 import android.view.ViewManager;
@@ -70,12 +83,6 @@ import android.view.ViewRoot;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.WindowManagerImpl;
-
-import com.android.internal.os.BinderInternal;
-import com.android.internal.os.RuntimeInit;
-import com.android.internal.os.SamplingProfilerIntegration;
-
-import org.apache.harmony.xnet.provider.jsse.OpenSSLSocketImpl;
 
 import java.io.File;
 import java.io.FileDescriptor;
@@ -91,8 +98,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
 import java.util.regex.Pattern;
-
-import dalvik.system.SamplingProfiler;
 
 final class SuperNotCalledException extends AndroidRuntimeException {
     public SuperNotCalledException(String msg) {
@@ -1189,10 +1194,23 @@ public final class ActivityThread {
         //    Slog.w(TAG, "Throwing away out-of-date resources!!!! "
         //            + r + " " + resDir);
         //}
-
+        
         AssetManager assets = new AssetManager();
+        assets.setThemeSupport(compInfo.isThemeable);
         if (assets.addAssetPath(resDir) == 0) {
             return null;
+        }
+        
+        /* Attach theme information to the resulting AssetManager when appropriate. */
+        Configuration config = getConfiguration();
+        if (compInfo.isThemeable && config != null) {
+            if (config.customTheme == null) {
+                config.customTheme = CustomTheme.getBootTheme();
+            }
+
+            if (!TextUtils.isEmpty(config.customTheme.getThemePackageName())) {
+                attachThemeAssets(assets, config.customTheme, false);
+            }
         }
 
         //Slog.i(TAG, "Resource: key=" + key + ", display metrics=" + metrics);
@@ -1218,6 +1236,81 @@ public final class ActivityThread {
             mActiveResources.put(key, new WeakReference<Resources>(r));
             return r;
         }
+    }
+    
+    /**
+     * Attach the necessary theme asset paths and meta information to convert an
+     * AssetManager to being globally "theme-aware".
+     *
+     * @param assets
+     * @param theme
+     * @param updating If true, this AssetManager has already been accessed and
+     *            special steps must be taken to update the underlying resource
+     *            table.
+     * @return true if the AssetManager is now theme-aware; false otherwise.
+     *         This can fail, for example, if the theme package has been been
+     *         removed and the theme manager has yet to revert formally back to
+     *         the framework default.
+     */
+    private boolean attachThemeAssets(AssetManager assets, CustomTheme theme, boolean updating) {
+        PackageInfo pi = null;
+        try {
+            pi = getPackageManager().getPackageInfo(theme.getThemePackageName(), 0);
+        } catch (RemoteException e) {
+        }
+        if (pi != null && pi.applicationInfo != null && pi.themeInfos != null) {
+            /*
+             * It's important that this is called before
+             * updateResourcesWithAssetPath as it depends on the result of
+             * getThemePackageName to figure out what to do with the resource
+             * redirection table.
+             */
+            assets.setThemePackageInfo(theme.getThemePackageName(),
+                    findThemeResourceId(pi.themeInfos, theme));
+
+            String themeResDir = pi.applicationInfo.publicSourceDir;
+            int cookie;
+            if (updating) {
+                cookie = assets.updateResourcesWithAssetPath(themeResDir);
+            } else {
+                cookie = assets.addAssetPath(themeResDir);
+            }
+            if (cookie != 0) {
+                assets.setThemeCookie(cookie);
+                return true;
+            } else {
+                Log.e(TAG, "Unable to " + (updating ? "update" : "add") + " theme assets at " +
+                        themeResDir);
+
+                /* Roll back the theme package info. */
+                assets.setThemePackageInfo(null, 0);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Searches for the high-level theme resource id for the specific
+     * &lt;theme&gt; tag being applied.
+     * <p>
+     * An individual theme package can contain multiple &lt;theme&gt; tags, each
+     * representing a separate theme choice from the user's perspective, even
+     * though the most common case is for there to be only 1.
+     *
+     * @return The style resource id or 0 if no match was found.
+     */
+    private int findThemeResourceId(ThemeInfo[] themeInfos, CustomTheme theme) {
+        String needle = theme.getThemeId();
+        if (themeInfos != null && !TextUtils.isEmpty(needle)) {
+            int n = themeInfos.length;
+            for (int i = 0; i < n; i++) {
+                ThemeInfo info = themeInfos[i];
+                if (needle.equals(info.themeId)) {
+                    return info.styleResourceId;
+                }
+            }
+        }
+        return 0;
     }
 
     /**
@@ -1620,6 +1713,16 @@ public final class ActivityThread {
 
         } catch (Exception e) {
             if (!mInstrumentation.onException(activity, e)) {
+                if (e instanceof InflateException) {
+                    Log.e(TAG, "Failed to inflate", e);
+                    String pkg = null;
+                    if (r.packageInfo != null && !TextUtils.isEmpty(r.packageInfo.getPackageName())) {
+                        pkg = r.packageInfo.getPackageName();
+                    }
+                    Intent intent = new Intent(Intent.ACTION_APP_LAUNCH_FAILURE,
+                            (pkg != null)? Uri.fromParts("package", pkg, null) : null);
+                    getSystemContext().sendBroadcast(intent);
+                }
                 throw new RuntimeException(
                     "Unable to start activity " + component
                     + ": " + e.toString(), e);
@@ -2921,14 +3024,20 @@ public final class ActivityThread {
         }
     }
 
-    final boolean applyConfigurationToResourcesLocked(Configuration config) {
+    /*
+     * Original code returned a boolean here to denote whether changes were
+     * detected.  But T-Mobile must know what specifically has changed to check
+     * later if the theme had changed, so we return the changes bitmap instead.
+     * Caller beware.
+     */
+    final int applyConfigurationToResourcesLocked(Configuration config) {
         if (mResConfiguration == null) {
             mResConfiguration = new Configuration();
         }
         if (!mResConfiguration.isOtherSeqNewer(config)) {
             if (DEBUG_CONFIGURATION) Slog.v(TAG, "Skipping new config: curSeq="
                     + mResConfiguration.seq + ", newSeq=" + config.seq);
-            return false;
+            return 0;
         }
         int changes = mResConfiguration.updateFrom(config);
         DisplayMetrics dm = getDisplayMetricsLocked(true);
@@ -2953,7 +3062,32 @@ public final class ActivityThread {
             if (r != null) {
                 if (DEBUG_CONFIGURATION) Slog.v(TAG, "Changing resources "
                         + r + " config to: " + config);
+                boolean themeChanged = (changes & ActivityInfo.CONFIG_THEME_RESOURCE) != 0;
+                if (themeChanged) {
+                    AssetManager am = r.getAssets();
+                    /*
+                     * Dynamically modify the AssetManager object to
+                     * replace the old asset path with the new one. This
+                     * is made possibly by native layer changes made by
+                     * T-Mobile.
+                     */
+                    if (am.hasThemeSupport()) {
+                        String oldThemePackage = am.getThemePackageName();
+                        int themeCookie = am.getThemeCookie();
+                        if (!TextUtils.isEmpty(oldThemePackage) && themeCookie != 0) {
+                            am.setThemePackageInfo(null, 0);
+                            am.removeAssetPath(oldThemePackage, themeCookie);
+                            am.setThemeCookie(0);
+                        }
+                        if (!TextUtils.isEmpty(config.customTheme.getThemePackageName())) {
+                            attachThemeAssets(am, config.customTheme, true);
+                        }
+                    }
+                }
                 r.updateConfiguration(config, dm);
+                if (themeChanged) {
+                    r.updateStringCache();
+                }
                 //Slog.i(TAG, "Updated app resources " + v.getKey()
                 //        + " " + r + ": " + r.getConfiguration());
             } else {
@@ -2962,12 +3096,14 @@ public final class ActivityThread {
             }
         }
         
-        return changes != 0;
+        return changes;
     }
     
     final void handleConfigurationChanged(Configuration config) {
 
         ArrayList<ComponentCallbacks> callbacks = null;
+
+        int diff = 0;
 
         synchronized (mPackages) {
             if (mPendingConfiguration != null) {
@@ -2984,7 +3120,7 @@ public final class ActivityThread {
             if (DEBUG_CONFIGURATION) Slog.v(TAG, "Handle configuration changed: "
                     + config);
         
-            applyConfigurationToResourcesLocked(config);
+            diff = applyConfigurationToResourcesLocked(config);
             
             if (!mConfiguration.isOtherSeqNewer(config)) {
                 return;
@@ -2997,7 +3133,20 @@ public final class ActivityThread {
         if (callbacks != null) {
             final int N = callbacks.size();
             for (int i=0; i<N; i++) {
-                performConfigurationChanged(callbacks.get(i), config);
+                ComponentCallbacks cb = callbacks.get(i);
+
+                // We removed the old resources object from the mActiveResources
+                // cache, now we need to trigger an update for each application.
+                if ((diff & ActivityInfo.CONFIG_THEME_RESOURCE) != 0) {
+                    if (cb instanceof Activity || cb instanceof Application) {
+                        Context context = ((ContextWrapper)cb).getBaseContext();
+                        if (context instanceof ContextImpl) {
+                            ((ContextImpl)context).refreshResourcesIfNecessary();
+                        }
+                    }
+                }
+
+                performConfigurationChanged(cb, config);
             }
         }
     }
@@ -3593,7 +3742,7 @@ public final class ActivityThread {
                     // We need to apply this change to the resources
                     // immediately, because upon returning the view
                     // hierarchy will be informed about it.
-                    if (applyConfigurationToResourcesLocked(newConfig)) {
+                    if (applyConfigurationToResourcesLocked(newConfig) != 0) {
                         // This actually changed the resources!  Tell
                         // everyone about it.
                         if (mPendingConfiguration == null ||

@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2008 The Android Open Source Project
+ * This code has been modified.  Portions copyright (C) 2010, T-Mobile USA, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +26,7 @@
 #include <utils/String8.h>
 #include <utils/TextOutput.h>
 #include <utils/Log.h>
+#include <utils/misc.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +45,7 @@
 #define TABLE_SUPER_NOISY(x) //x
 #define LOAD_TABLE_NOISY(x) //x
 #define TABLE_THEME(x) //x
+#define REDIRECT_NOISY(x) //x
 
 namespace android {
 
@@ -62,6 +65,8 @@ namespace android {
 #define htons(x)    (x)
 #endif
 #endif
+
+#define PACKAGE_RESOURCE_ID_TO_DUMP 10
 
 static void printToLogFunc(void* cookie, const char* txt)
 {
@@ -1408,6 +1413,13 @@ status_t ResTable::Theme::applyStyle(uint32_t resID, bool force)
     const bag_entry* bag;
     uint32_t bagTypeSpecFlags = 0;
     mTable.lock();
+    uint32_t redirect = mTable.lookupRedirectionMap(resID);
+    if (redirect != 0 || resID == 0x01030005) {
+        REDIRECT_NOISY(LOGW("applyStyle: PERFORMED REDIRECT OF ident=0x%08x FOR redirect=0x%08x\n", resID, redirect));
+    }
+    if (redirect != 0) {
+        resID = redirect;
+    }
     const ssize_t N = mTable.getBagLocked(resID, &bag, &bagTypeSpecFlags);
     TABLE_NOISY(LOGV("Applying style 0x%08x to theme %p, count=%d", resID, this, N));
     if (N < 0) {
@@ -1833,6 +1845,8 @@ void ResTable::uninit()
 
     mPackageGroups.clear();
     mHeaders.clear();
+
+    clearRedirections();
 }
 
 bool ResTable::getResourceName(uint32_t resID, resource_name* outName) const
@@ -2036,6 +2050,26 @@ ssize_t ResTable::resolveReference(Res_value* value, ssize_t blockIndex,
     return blockIndex;
 }
 
+uint32_t ResTable::lookupRedirectionMap(uint32_t resID) const
+{
+    if (mError != NO_ERROR) {
+        return 0;
+    }
+
+    const int p = Res_GETPACKAGE(resID)+1;
+    const int t = Res_GETTYPE(resID)+1;
+    const int e = Res_GETENTRY(resID);
+
+    const size_t N = mRedirectionMap.size();
+    for (size_t i=0; i<N; i++) {
+        PackageResMap* resMap = mRedirectionMap[i];
+        if (resMap->package == p) {
+            return resMap->lookup(t, e);
+        }
+    }
+    return 0;
+}
+
 const char16_t* ResTable::valueToString(
     const Res_value* value, size_t stringBlock,
     char16_t tmpBuffer[TMP_BUFFER_SIZE], size_t* outLen)
@@ -2211,7 +2245,19 @@ ssize_t ResTable::getBagLocked(uint32_t resID, const bag_entry** outBag,
             if (parent) {
                 const bag_entry* parentBag;
                 uint32_t parentTypeSpecFlags = 0;
-                const ssize_t NP = getBagLocked(parent, &parentBag, &parentTypeSpecFlags);
+                uint32_t parentRedirect = lookupRedirectionMap(parent);
+                uint32_t parentActual = parent;
+                if (parentRedirect != 0 || parent == 0x01030005) {
+                    if (parentRedirect == resID) {
+                        REDIRECT_NOISY(LOGW("applyStyle(parent): ignoring circular redirect from parent=0x%08x to parentRedirect=0x%08x\n", parent, parentRedirect));
+                    } else {
+                        REDIRECT_NOISY(LOGW("applyStyle(parent): PERFORMED REDIRECT OF parent=0x%08x FOR parentRedirect=0x%08x\n", parent, parentRedirect));
+                        if (parentRedirect != 0) {
+                            parentActual = parentRedirect;
+                        }
+                    }
+                }
+                const ssize_t NP = getBagLocked(parentActual, &parentBag, &parentTypeSpecFlags);
                 const size_t NT = ((NP >= 0) ? NP : 0) + N;
                 set = (bag_set*)malloc(sizeof(bag_set)+sizeof(bag_entry)*NT);
                 if (set == NULL) {
@@ -3998,8 +4044,315 @@ status_t ResTable::parsePackage(const ResTable_package* const pkg,
     return NO_ERROR;
 }
 
-#ifndef HAVE_ANDROID_OS
+void ResTable::removeAssetsByCookie(const String8 &packageName, void* cookie)
+{
+    mError = NO_ERROR;
+
+    size_t N = mHeaders.size();
+    for (size_t i = 0; i < N; i++) {
+        Header* header = mHeaders[i];
+        if ((size_t)header->cookie == (size_t)cookie) {
+            if (header->ownedData != NULL) {
+                free(header->ownedData);
+            }
+            mHeaders.removeAt(i);
+            break;
+        }
+    }
+    size_t pgCount = mPackageGroups.size();
+    for (size_t pgIndex = 0; pgIndex < pgCount; pgIndex++) {
+        PackageGroup* pg = mPackageGroups[pgIndex];
+
+        size_t pkgCount = pg->packages.size();
+        size_t index = pkgCount;
+        for (size_t pkgIndex = 0; pkgIndex < pkgCount; pkgIndex++) {
+            const Package* pkg = pg->packages[pkgIndex];
+            if (String8(String16(pkg->package->name)).compare(packageName) == 0) {
+                index = pkgIndex;
+                LOGV("Delete Package %d id=%d name=%s\n",
+                     (int)pkgIndex, pkg->package->id,
+                     String8(String16(pkg->package->name)).string());
+                break;
+            }
+        }
+        if (index < pkgCount) {
+            const Package* pkg = pg->packages[index];
+            uint32_t id = dtohl(pkg->package->id);
+            if (id != 0 && id < 256) {
+                mPackageMap[id] = 0;
+            }
+            if (pkgCount == 1) {
+                LOGV("Delete Package Group %d id=%d packageCount=%d name=%s\n",
+                      (int)pgIndex, pg->id, (int)pg->packages.size(),
+                      String8(pg->name).string());
+                mPackageGroups.removeAt(pgIndex);
+                delete pg;
+            } else {
+                pg->packages.removeAt(index);
+                delete pkg;
+            }
+            return;
+        }
+    }
+}
+
+ResTable::PackageResMap::PackageResMap()
+    : mEntriesByType(NULL)
+{
+}
+
+ResTable::PackageResMap::~PackageResMap()
+{
+    if (mEntriesByType != NULL) {
+        SharedBuffer* buf = SharedBuffer::bufferFromData(mEntriesByType);
+        const size_t N = buf->size() / sizeof(mEntriesByType[0]);
+        for (size_t i = 0; i < N; i++) {
+            uint32_t* entries = mEntriesByType[i];
+            if (entries != NULL) {
+                SharedBuffer::bufferFromData(entries)->release();
+            }
+        }
+        buf->release();
+    }
+}
+
+uint32_t* ResTable::PackageResMap::parseMapType(const unsigned char* ptr, const unsigned char* end)
+{
+    SharedBuffer* buf = NULL;
+    for (; ptr + 6 <= end; ptr += 6) {
+        uint16_t entry = *(uint16_t*)ptr;
+        uint32_t resID = *(uint32_t*)(ptr + 2);
+        REDIRECT_NOISY(LOGW("map type got entry=0x%04x, resID=0x%08x\n", entry, resID));
+        size_t currentSize = (buf != NULL) ? buf->size() : 0;
+        size_t entrySize = (entry+1) * sizeof(resID);
+        if (entrySize > currentSize) {
+            unsigned int requestSize = roundUpPower2(entrySize);
+            REDIRECT_NOISY(LOGW("allocating buffer (%p) at requestSize=%d\n", buf, (int)requestSize));
+            if (buf == NULL) {
+                buf = SharedBuffer::alloc(requestSize);
+            } else {
+                buf = buf->editResize(requestSize);
+            }
+            memset((unsigned char*)buf->data()+currentSize, 0, requestSize - currentSize);
+            REDIRECT_NOISY(LOGW("allocated buf=%p\n", buf));
+        }
+        uint32_t* entries = (uint32_t*)buf->data();
+        entries[entry] = resID;
+    }
+    return (buf != NULL) ? (uint32_t*)buf->data() : NULL;
+}
+
+/*
+ * Parse the resource mappings file.
+ *
+ * The format of this file begins with a simple header identifying the number
+ * of types inside, followed by a table mapping each type to an offset further
+ * in the file.  At each offset mentioned is a set of resource ID mappings to
+ * be parsed out and applied to a sparse array that is ultimately used to
+ * lookup resource redirections (the indices are entries in the associated
+ * package space and the values are the replacement resID's from the theme
+ * itself)
+ *
+ * Detailed information of each section:
+ *
+ *  | bytes | description
+ *  |-------+-----------------------
+ *  |     2 | file format version (first version is 1)
+ *  |     2 | number of resource types (think Res_GETTYPE) in the mapping
+ *
+ * For each resource type:
+ *
+ *  +-------+-----------------------
+ *  |     1 | type identifier
+ *  |     4 | file offset containing the entry mapping
+ *  |     4 | length of the entry mapping section for this type
+ *      ...
+ *
+ * At each file offset mentioned in the type header:
+ *
+ *  +-------+-----------------------
+ *  |     2 | entry id to be replaced (combined with the type and package this
+ *  |       | forms a resID)
+ *  |     4 | resID in the theme space which is to replace the previous entry
+ *      ...
+ */
+bool ResTable::PackageResMap::parseMap(const unsigned char* basePtr,
+    const unsigned char* endPtr)
+{
+    LOG_FATAL_IF(mEntriesByType != NULL, "parseMap must only be called once");
+
+    if (basePtr + 4 > endPtr) {
+        return false;
+    }
+    uint16_t version = *(uint16_t*)basePtr;
+    uint16_t numTypes = *(uint16_t*)(basePtr + 2);
+    const unsigned char* headerPtr = basePtr + 4;
+
+    REDIRECT_NOISY(LOGW("file version=%d\n", version));
+    REDIRECT_NOISY(LOGW("read %d numTypes\n", numTypes));
+
+    while (numTypes-- > 0) {
+        uint8_t type;
+        uint32_t* entries = NULL;
+        if (headerPtr + 9 < endPtr) {
+            type = *(uint8_t*)headerPtr;
+            uint32_t offset = *(uint32_t*)(headerPtr + 1);
+            uint32_t length = *(uint32_t*)(headerPtr + 5);
+            headerPtr += 9;
+            REDIRECT_NOISY(LOGW("got type=0x%02x\n", type));
+            if (basePtr + offset + length <= endPtr) {
+                REDIRECT_NOISY(LOGW("parsing type...\n"));
+                const unsigned char* entryStartPtr = basePtr + offset;
+                const unsigned char* entryEndPtr = entryStartPtr + length;
+                entries = parseMapType(entryStartPtr, entryEndPtr);
+            }
+        }
+        if (entries == NULL) {
+            return false;
+        }
+        REDIRECT_NOISY(LOGW("inserting type 0x%02x with %p\n", type, entries));
+        insert(type, entries);
+    }
+
+    return true;
+}
+
+/*
+ * Load the redirection map from the supplied map path.
+ *
+ * The path is expected to be a directory containing individual map cache files
+ * for each package that is to have resources redirected.  Only those packages
+ * that are included in this ResTable will be loaded into the redirection map.
+ * For this reason, this method should be called only after all resource
+ * bundles have been added to the table.
+ */
+status_t ResTable::addRedirections(int package, const char* cachePath)
+{
+    LOGV("Adding redirections for package 0x%02x at %s\n", package, cachePath);
+
+    if (package != 0x01 && package != 0x7f) {
+        REDIRECT_NOISY(LOGW("invalid package 0x%02x: should be either 0x01 (android) or 0x7f (application)\n", package));
+        return BAD_TYPE;
+    }
+
+    ResTable::PackageResMap* resMap = ResTable::PackageResMap::createFromCache(package, cachePath);
+    if (resMap != NULL) {
+        REDIRECT_NOISY(LOGW("loaded cache stuff for cachePath=%s (package=%d)\n", cachePath, package));
+        mRedirectionMap.add(resMap);
+        return NO_ERROR;
+    } else {
+        REDIRECT_NOISY(LOGW("failed to parse redirection path at %s\n", cachePath));
+        return BAD_TYPE;
+    }
+}
+
+void ResTable::clearRedirections()
+{
+    const size_t N = mRedirectionMap.size();
+    for (size_t i=0; i<N; i++) {
+        PackageResMap* resMap = mRedirectionMap[i];
+        delete resMap;
+    }
+    mRedirectionMap.clear();
+}
+
+ResTable::PackageResMap* ResTable::PackageResMap::createFromCache(int package, const char* cachePath)
+{
+    FILE* cacheFile = fopen(cachePath, "r");
+    if (cacheFile == NULL) {
+        REDIRECT_NOISY(LOGW("unable to open resource mapping path %s: %s\n", cachePath, strerror(errno)));
+        return NULL;
+    }
+
+    if (fseek(cacheFile, 0, SEEK_END) != 0) {
+        fclose(cacheFile);
+        return NULL;
+    }
+
+    long length = ftell(cacheFile);
+    REDIRECT_NOISY(LOGW("file length is %d\n", (int)length));
+    if (length < 4) {
+        fclose(cacheFile);
+        return NULL;
+    }
+
+    ResTable::PackageResMap* resMap = NULL;
+    FileMap* fileMap = new FileMap;
+    if (fileMap != NULL) {
+        if (fileMap->create(cachePath, fileno(cacheFile), 0, length, true)) {
+            REDIRECT_NOISY(LOGW("successfully mapped %s\n", cachePath));
+            resMap = new ResTable::PackageResMap();
+            if (resMap != NULL) {
+                resMap->package = package;
+                const unsigned char* ptr = (const unsigned char*)fileMap->getDataPtr();
+                if (!resMap->parseMap(ptr, ptr + length)) {
+                    REDIRECT_NOISY(LOGW("failed to parse map!\n"));
+                    delete resMap;
+                    resMap = NULL;
+                }
+            }
+        } else {
+            REDIRECT_NOISY(LOGW("unable to map '%s': %s\n", cachePath, strerror(errno)));
+        }
+
+        fileMap->release();
+    }
+
+    fclose(cacheFile);
+
+    return resMap;
+}
+
+uint32_t ResTable::PackageResMap::lookup(int type, int entry)
+{
+    if (mEntriesByType == NULL) {
+        return 0;
+    }
+    size_t maxTypes = SharedBuffer::bufferFromData(mEntriesByType)->size() /
+        sizeof(mEntriesByType[0]);
+    if (type < 0 || type >= maxTypes) {
+        return 0;
+    }
+    uint32_t* entries = mEntriesByType[type];
+    if (entries == NULL) {
+        return 0;
+    }
+    size_t maxEntries = SharedBuffer::bufferFromData(entries)->size() /
+        sizeof(entries[0]);
+    if (entry < 0 || entry >= maxEntries) {
+        return 0;
+    }
+    return entries[entry];
+}
+
+void ResTable::PackageResMap::insert(int type, const uint32_t* entries)
+{
+    SharedBuffer* buf = NULL;
+    size_t currentSize = 0;
+    if (mEntriesByType != NULL) {
+        buf = SharedBuffer::bufferFromData(mEntriesByType);
+        currentSize = buf->size();
+    }
+    size_t typeSize = (type+1) * sizeof(uint32_t*);
+    if (typeSize > currentSize) {
+        unsigned int requestSize = roundUpPower2(typeSize);
+        REDIRECT_NOISY(LOGW("allocating new type buffer (%p) at size requestSize=%d\n", buf, requestSize));
+        if (buf == NULL) {
+            buf = SharedBuffer::alloc(requestSize);
+        } else {
+            buf = buf->editResize(requestSize);
+        }
+        memset((unsigned char*)buf->data()+currentSize, 0, requestSize - currentSize);
+        REDIRECT_NOISY(LOGW("allocated new type buffer %p\n", buf));
+    }
+    uint32_t** entriesByType = (uint32_t**)buf->data();
+    entriesByType[type] = (uint32_t*)entries;
+    mEntriesByType = entriesByType;
+}
+
 #define CHAR16_TO_CSTR(c16, len) (String8(String16(c16,len)).string())
+
+#ifndef HAVE_ANDROID_OS
 
 #define CHAR16_ARRAY_EQ(constant, var, len) \
         ((len == (sizeof(constant)/sizeof(constant[0]))) && (0 == memcmp((var), (constant), (len))))
@@ -4425,5 +4778,159 @@ void ResTable::print(bool inclValues) const
 }
 
 #endif // HAVE_ANDROID_OS
+
+void ResTable::dump() const
+{
+    LOGI("mError=0x%x (%s)\n", mError, strerror(mError));
+#if 0
+    LOGI("mParams=%c%c-%c%c,\n",
+          mParams.language[0], mParams.language[1],
+          mParams.country[0], mParams.country[1]);
+#endif
+    size_t pgCount = mPackageGroups.size();
+    LOGI("Package Groups (%d)\n", (int)pgCount);
+    for (size_t pgIndex=0; pgIndex<pgCount; pgIndex++) {
+        const PackageGroup* pg = mPackageGroups[pgIndex];
+        LOGI("Package Group %d id=%d packageCount=%d name=%s\n",
+             (int)pgIndex, pg->id, (int)pg->packages.size(),
+             String8(pg->name).string());
+
+        size_t pkgCount = pg->packages.size();
+        for (size_t pkgIndex=0; pkgIndex<pkgCount; pkgIndex++) {
+            const Package* pkg = pg->packages[pkgIndex];
+            if (pkg->package->id != PACKAGE_RESOURCE_ID_TO_DUMP) continue; // HACK!
+            size_t count = 0;
+            size_t typeCount = pkg->types.size();
+            LOGI("  Package %d id=%d name=%s typeCount=%d\n", (int)pkgIndex,
+                 pkg->package->id, String8(String16(pkg->package->name)).string(),
+                 (int)typeCount);
+            for (size_t typeIndex=0; typeIndex<typeCount&&count<10; typeIndex++) {
+                const Type* typeConfigs = pkg->getType(typeIndex);
+                if (typeConfigs == NULL) {
+                    LOGI("    type %d NULL\n", (int)typeIndex);
+                    continue;
+                }
+                const size_t NTC = typeConfigs->configs.size();
+                LOGI("    type %d configCount=%d entryCount=%d\n",
+                     (int)typeIndex, (int)NTC, (int)typeConfigs->entryCount);
+                if (typeConfigs->typeSpecFlags != NULL) {
+                    for (size_t entryIndex=0; entryIndex<typeConfigs->entryCount&&count<10; entryIndex++) {
+                        uint32_t resID = (0xff000000 & ((pkg->package->id)<<24))
+                        | (0x00ff0000 & ((typeIndex+1)<<16))
+                        | (0x0000ffff & (entryIndex));
+                        resource_name resName;
+                        this->getResourceName(resID, &resName);
+                        count++;
+                        LOGI("      spec resource 0x%08x %s:%s/%s: flags=0x%08x\n",
+                             resID,
+                             CHAR16_TO_CSTR(resName.package, resName.packageLen),
+                             CHAR16_TO_CSTR(resName.type, resName.typeLen),
+                             CHAR16_TO_CSTR(resName.name, resName.nameLen),
+                             dtohl(typeConfigs->typeSpecFlags[entryIndex]));
+                    }
+                }
+                for (size_t configIndex=0; configIndex<NTC&&count<10; configIndex++) {
+                    const ResTable_type* type = typeConfigs->configs[configIndex];
+                    if ((((uint64_t)type)&0x3) != 0) {
+                        LOGI("      NON-INTEGER ResTable_type ADDRESS: %p\n", type);
+                        continue;
+                    }
+                    count++;
+                    LOGI("      config %d lang=%c%c cnt=%c%c orien=%d touch=%d density=%d key=%d infl=%d nav=%d w=%d h=%d\n",
+                         (int)configIndex,
+                         type->config.language[0] ? type->config.language[0] : '-',
+                         type->config.language[1] ? type->config.language[1] : '-',
+                         type->config.country[0] ? type->config.country[0] : '-',
+                         type->config.country[1] ? type->config.country[1] : '-',
+                         type->config.orientation,
+                         type->config.touchscreen,
+                         dtohs(type->config.density),
+                         type->config.keyboard,
+                         type->config.inputFlags,
+                         type->config.navigation,
+                         dtohs(type->config.screenWidth),
+                         dtohs(type->config.screenHeight));
+                    size_t entryCount = dtohl(type->entryCount);
+                    uint32_t entriesStart = dtohl(type->entriesStart);
+                    if ((entriesStart&0x3) != 0) {
+                        LOGI("      NON-INTEGER ResTable_type entriesStart OFFSET: %p\n", (void*)entriesStart);
+                        continue;
+                    }
+                    uint32_t typeSize = dtohl(type->header.size);
+                    if ((typeSize&0x3) != 0) {
+                        LOGI("      NON-INTEGER ResTable_type header.size: %p\n", (void*)typeSize);
+                        continue;
+                    }
+                    for (size_t entryIndex=0; entryIndex<entryCount&&count<10; entryIndex++) {
+                        const uint8_t* const end = ((const uint8_t*)type)
+                            + dtohl(type->header.size);
+                        const uint32_t* const eindex = (const uint32_t*)
+                            (((const uint8_t*)type) + dtohs(type->header.headerSize));
+                        uint32_t thisOffset = dtohl(eindex[entryIndex]);
+                        if (thisOffset == ResTable_type::NO_ENTRY) {
+                            continue;
+                        }
+
+                        uint32_t resID = (0xff000000 & ((pkg->package->id)<<24))
+                            | (0x00ff0000 & ((typeIndex+1)<<16))
+                            | (0x0000ffff & (entryIndex));
+                        resource_name resName;
+                        this->getResourceName(resID, &resName);
+                        count++;
+                        LOGI("        resource 0x%08x %s:%s/%s: ", resID,
+                             CHAR16_TO_CSTR(resName.package, resName.packageLen),
+                             CHAR16_TO_CSTR(resName.type, resName.typeLen),
+                             CHAR16_TO_CSTR(resName.name, resName.nameLen));
+                        if ((thisOffset&0x3) != 0) {
+                            LOGI("NON-INTEGER OFFSET: %p\n", (void*)thisOffset);
+                            continue;
+                        }
+                        if ((thisOffset+sizeof(ResTable_entry)) > typeSize) {
+                            LOGI("OFFSET OUT OF BOUNDS: %p+%p (size is %p)\n",
+                                 (void*)entriesStart, (void*)thisOffset,
+                                 (void*)typeSize);
+                            continue;
+                        }
+
+                        const ResTable_entry* ent = (const ResTable_entry*)
+                            (((const uint8_t*)type) + entriesStart + thisOffset);
+                        if (((entriesStart + thisOffset)&0x3) != 0) {
+                            LOGI("NON-INTEGER ResTable_entry OFFSET: %p\n",
+                                 (void*)(entriesStart + thisOffset));
+                            continue;
+                        }
+                        if ((dtohs(ent->flags)&ResTable_entry::FLAG_COMPLEX) != 0) {
+                            LOGI("<bag>");
+                        } else {
+                            uint16_t esize = dtohs(ent->size);
+                            if ((esize&0x3) != 0) {
+                                LOGI("NON-INTEGER ResTable_entry SIZE: %p\n", (void*)esize);
+                                continue;
+                            }
+                            if ((thisOffset+esize) > typeSize) {
+                                LOGI("ResTable_entry OUT OF BOUNDS: %p+%p+%p (size is %p)\n",
+                                     (void*)entriesStart, (void*)thisOffset,
+                                     (void*)esize, (void*)typeSize);
+                                continue;
+                            }
+
+                            const Res_value* value = (const Res_value*)
+                                (((const uint8_t*)ent) + esize);
+                            count++;
+                            LOGI("t=0x%02x d=0x%08x (s=0x%04x r=0x%02x)",
+                                 (int)value->dataType, (int)dtohl(value->data),
+                                 (int)dtohs(value->size), (int)value->res0);
+                        }
+
+                        if ((dtohs(ent->flags)&ResTable_entry::FLAG_PUBLIC) != 0) {
+                            LOGI(" (PUBLIC)");
+                        }
+                        LOGI("\n");
+                    }
+                }
+            }
+        }
+    }
+}
 
 }   // namespace android
